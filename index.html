@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Healio Transfer</title>
+<style>
+  :root { --bg:#f5f7fa; --card:#fff; --text:#1c2430; --muted:#6b7686; --line:#e1e6ee; --accent:#1f8a70; --danger:#c0392b; --sel:#e6f5f0; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#12161c; --card:#1b2129; --text:#e6ebf2; --muted:#8c97a7; --line:#2b3340; --accent:#3cc19f; --danger:#ef6b5b; --sel:#17342d; }
+  }
+  * { box-sizing:border-box; }
+  [hidden] { display:none !important; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.4 system-ui,Segoe UI,sans-serif; }
+  main { max-width:760px; margin:0 auto; padding:16px 16px 60px; }
+  header { display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap; margin-bottom:14px; }
+  h1 { font-size:20px; margin:0; }
+  h2 { font-size:14px; margin:0 0 10px; color:var(--muted); font-weight:600; }
+  .me { display:flex; align-items:center; gap:8px; font-size:14px; }
+  .dot { width:9px; height:9px; border-radius:50%; background:var(--danger); }
+  .dot.on { background:var(--accent); }
+  .tabs { display:flex; gap:6px; margin-bottom:14px; }
+  .tabs button { flex:1; background:var(--card); color:var(--text); border:1px solid var(--line); padding:10px; position:relative; }
+  .tabs button.act { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .badge { background:var(--danger); color:#fff; border-radius:9px; padding:0 6px; font-size:12px; margin-left:6px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; margin-bottom:14px; }
+  button { font:inherit; background:var(--accent); color:#fff; border:0; border-radius:6px; padding:7px 14px; cursor:pointer; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  button.ghost { background:transparent; color:var(--text); border:1px solid var(--line); }
+  button.danger { background:transparent; color:var(--danger); border:1px solid var(--line); }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+  .row:empty { display:none; }
+  .peers { display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:8px; }
+  .peer { background:var(--bg); color:var(--text); border:2px solid var(--line); padding:12px 8px; text-align:center; }
+  .peer.sel { border-color:var(--accent); background:var(--sel); }
+  .peer small { display:block; color:var(--accent); font-size:12px; }
+  .hint { color:var(--muted); font-size:13px; }
+  #drop { border:2px dashed var(--line); border-radius:10px; padding:22px 12px; text-align:center; color:var(--muted); }
+  #drop.over { border-color:var(--accent); color:var(--accent); }
+  #drop .row { justify-content:center; }
+  .tcard { border:1px solid var(--line); border-radius:8px; padding:12px; margin-top:10px; }
+  .tcard:first-child { margin-top:0; }
+  .ttl { font-weight:600; }
+  .sub { color:var(--muted); font-size:13px; word-break:break-all; }
+  .stat { margin:6px 0; }
+  .pinbox { background:var(--sel); border-radius:6px; padding:8px 10px; margin:8px 0; }
+  .pinbox b { font-size:24px; letter-spacing:6px; margin-left:6px; }
+  .bar { height:6px; background:var(--line); border-radius:3px; overflow:hidden; margin:6px 0 4px; }
+  .bar i { display:block; height:100%; width:0; background:var(--accent); transition:width .3s; }
+  .list:empty::before { content:attr(data-empty); color:var(--muted); font-size:13px; }
+  #ov { position:fixed; inset:0; background:rgba(0,0,0,.55); display:flex; align-items:center; justify-content:center; padding:16px; z-index:10; }
+  #ov .box { background:var(--card); border-radius:12px; padding:20px; width:100%; max-width:380px; }
+  #ov input { width:100%; font-size:28px; text-align:center; letter-spacing:10px; padding:8px; border:2px solid var(--line); border-radius:8px; background:var(--bg); color:var(--text); margin:10px 0 4px; }
+  #pinErr { color:var(--danger); font-size:13px; min-height:18px; }
+  #toast { position:fixed; bottom:16px; left:50%; transform:translateX(-50%); background:var(--text); color:var(--bg); padding:8px 14px; border-radius:8px; z-index:20; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Healio Transfer</h1>
+    <div class="me"><span class="dot" id="dot"></span><span id="meName"></span><button class="ghost" id="rename">Rename</button></div>
+  </header>
+
+  <div class="tabs">
+    <button id="tabSend" class="act">Send</button>
+    <button id="tabRecv">Receive<span class="badge" id="badge" hidden></span></button>
+  </div>
+
+  <section id="paneSend">
+    <div class="card">
+      <h2>1. Choose a device</h2>
+      <div class="peers" id="peers"></div>
+      <div class="hint" id="noPeers" hidden>Nobody else is online. On the other laptop open <b id="url"></b></div>
+    </div>
+    <div class="card">
+      <h2>2. Choose what to send</h2>
+      <div id="drop">
+        Drop files or folders here
+        <div class="row">
+          <button id="pickFiles">Choose files</button>
+          <button id="pickFolder">Choose folder</button>
+        </div>
+      </div>
+      <input type="file" id="fileInput" multiple hidden>
+      <input type="file" id="folderInput" webkitdirectory hidden>
+      <div class="hint" id="selInfo" style="margin-top:10px"></div>
+      <div class="row">
+        <button id="sendBtn" disabled>Send</button>
+        <button class="ghost" id="clearBtn" hidden>Clear</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Outgoing</h2>
+      <div class="list" id="outList" data-empty="Nothing sent yet."></div>
+    </div>
+  </section>
+
+  <section id="paneRecv" hidden>
+    <div class="card">
+      <h2>Ready to receive</h2>
+      <div>You are visible as <b id="meName2"></b>. Keep this page open; incoming files will ask for your approval and a PIN.</div>
+    </div>
+    <div class="card">
+      <h2>Incoming</h2>
+      <div class="list" id="inList" data-empty="Nothing received yet."></div>
+    </div>
+  </section>
+</main>
+
+<div id="ov" hidden></div>
+<div id="toast" hidden></div>
+
+<script>
+const $ = id => document.getElementById(id), enc = encodeURIComponent;
+const ACTIVE = ["offered","accepted","ready","downloading"];
+function h(tag, props, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (k === "class") e.className = v; else if (k.startsWith("on")) e[k] = v; else e.setAttribute(k, v);
+  }
+  for (const c of kids.flat()) if (c != null) e.append(c);
+  return e;
+}
+function fmtSize(n) {
+  if (n < 1024) return Math.round(n) + " B";
+  const u = ["KB","MB","GB","TB"]; let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < 3);
+  return n.toFixed(n >= 100 ? 0 : 1) + " " + u[i];
+}
+function fmtTime(s) {
+  s = Math.round(s);
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m " + (s % 60) + "s";
+  return Math.floor(s / 3600) + "h " + Math.floor(s % 3600 / 60) + "m";
+}
+function toast(msg) {
+  const t = $("toast"); t.textContent = msg; t.hidden = false;
+  clearTimeout(toast.t); toast.t = setTimeout(() => t.hidden = true, 3500);
+}
+
+// ---------- identity ----------
+let myId = null;
+try { myId = sessionStorage.getItem("id"); } catch (e) {}
+if (!myId) {
+  myId = (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2) + Date.now().toString(36));
+  try { sessionStorage.setItem("id", myId); } catch (e) {}
+}
+let myName = null;
+try { myName = localStorage.getItem("name"); } catch (e) {}
+if (!myName) myName = "Device-" + Math.floor(1000 + Math.random() * 9000);
+const me = { id: myId, name: myName };
+
+// ---------- state ----------
+let ws = null, peers = [], target = null, sel = [];
+const tr = {}, outbox = {}, upctl = {}, dlNext = {}, cards = {};
+
+function wsend(m) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(m)); }
+
+function connect() {
+  const proto = location.protocol === "https:" ? "wss://" : "ws://";
+  ws = new WebSocket(proto + location.host + "/ws?id=" + enc(me.id) + "&name=" + enc(me.name));
+  ws.onopen = () => $("dot").classList.add("on");
+  ws.onclose = () => { $("dot").classList.remove("on"); setTimeout(connect, 1500); };
+  ws.onmessage = e => onMsg(JSON.parse(e.data));
+}
+
+function onMsg(d) {
+  if (d.type === "peers") {
+    me.name = d.me_name; peers = d.peers;
+    if (target && !peers.some(p => p.id === target)) target = null;
+    renderMe(); renderPeers(); renderSend();
+  } else if (d.type === "transfer") {
+    tr[d.t.id] = d.t; onTransfer(d.t); renderTransfers();
+  } else if (d.type === "pin_bad") {
+    const el = $("pinErr");
+    if (el) { el.textContent = "Wrong PIN. " + d.left + " tries left."; $("pinIn").value = ""; $("pinIn").focus(); }
+  } else if (d.type === "error") {
+    toast(d.msg);
+  }
+}
+
+function onTransfer(t) {
+  if (t.frm === me.id) {
+    if (!ACTIVE.includes(t.state)) { if (upctl[t.id]) upctl[t.id].abort(); delete outbox[t.ref]; return; }
+    if ((t.state === "accepted" || (t.relay && ["ready","downloading"].includes(t.state))) && !upctl[t.id]) {
+      if (outbox[t.ref]) startUpload(t);
+      else wsend({ type: "cancel", tid: t.id, reason: "sender page reloaded" });
+    }
+  }
+  // Receiver: download each file in turn. t.done is how many have arrived; fetch that one next.
+  if (t.to === me.id && ["ready", "downloading"].includes(t.state) && t.done < t.count) {
+    if (dlNext[t.id] !== t.done) { dlNext[t.id] = t.done; saveT(t.id, t.done); }
+  }
+}
+
+// ---------- sending ----------
+async function startUpload(t) {
+  const items = outbox[t.ref], ctl = new AbortController();
+  upctl[t.id] = ctl;
+  // Sequential, in index order: a folder is zipped on the fly server-side and entries must arrive in order.
+  for (let i = 0; i < items.length; i++) {
+    try {
+      const r = await fetch("/api/up/" + t.id + "/" + i + "?key=" + enc(t.key),
+        { method: "POST", body: items[i].file, signal: ctl.signal });
+      if (!r.ok) throw new Error(r.status);
+    } catch (e) {
+      if (!ctl.signal.aborted) wsend({ type: "cancel", tid: t.id, reason: "upload failed" });
+      return;
+    }
+  }
+}
+
+function doSend() {
+  if (!target || !sel.length) return;
+  const ref = Math.random().toString(36).slice(2);
+  outbox[ref] = sel;
+  wsend({ type: "offer", to: target, ref, files: sel.map(s => ({ name: s.rel, size: s.file.size })) });
+  sel = []; renderSend();
+}
+
+function addItems(list) {
+  const have = new Set(sel.map(s => s.rel));
+  for (const it of list) if (!have.has(it.rel)) { sel.push(it); have.add(it.rel); }
+  renderSend();
+}
+
+async function walk(entry, prefix, out) {
+  if (entry.isFile) {
+    const f = await new Promise((res, rej) => entry.file(res, rej));
+    out.push({ file: f, rel: prefix + entry.name });
+  } else if (entry.isDirectory) {
+    const r = entry.createReader(); let batch;
+    do {
+      batch = await new Promise((res, rej) => r.readEntries(res, rej));
+      for (const e of batch) await walk(e, prefix + entry.name + "/", out);
+    } while (batch.length);
+  }
+}
+
+// ---------- receiving ----------
+function saveT(tid, i) {
+  const t = tr[tid]; if (!t) return;
+  const a = h("a", { href: "/api/down/" + t.id + "/" + (i || 0) + "?key=" + enc(t.key), download: "" });
+  document.body.append(a); a.click(); a.remove();
+}
+function cancelT(tid) {
+  const t = tr[tid];
+  wsend({ type: t.state === "offered" && t.to === me.id ? "decline" : "cancel", tid });
+}
+function dismiss(tid) {
+  if (cards[tid]) cards[tid].el.remove();
+  delete cards[tid]; delete tr[tid];
+}
+
+// ---------- rendering ----------
+function renderMe() { $("meName").textContent = me.name; $("meName2").textContent = me.name; }
+
+function renderPeers() {
+  const box = $("peers");
+  box.replaceChildren(...peers.map(p =>
+    h("button", { class: "peer" + (p.id === target ? " sel" : ""), onclick: () => { target = p.id; renderPeers(); renderSend(); } },
+      p.name, h("small", {}, "online"))));
+  $("noPeers").hidden = peers.length > 0;
+}
+
+function renderSend() {
+  const n = sel.length, size = sel.reduce((a, s) => a + s.file.size, 0);
+  $("selInfo").textContent = n ? n + " file" + (n > 1 ? "s" : "") + " selected · " + fmtSize(size) : "Nothing selected.";
+  $("clearBtn").hidden = !n;
+  $("sendBtn").disabled = !(n && target);
+  const t = peers.find(p => p.id === target);
+  $("sendBtn").textContent = t ? "Send to " + t.name : "Send";
+}
+
+function statusOf(t) {
+  const out = t.frm === me.id, n = out ? t.to_name : t.frm_name;
+  const of = (!t.zip && t.count > 1) ? " (file " + Math.min(t.done + 1, t.count) + " of " + t.count + ")" : "";
+  switch (t.state) {
+    case "offered": return out ? "Waiting for " + n + " to accept…" : "Waiting for your approval";
+    case "accepted": return out ? "Starting…" : "Accepted. Waiting for the sender…";
+    case "ready": return out ? "Waiting for " + n + " to start the download…" : "Ready. Starting download…";
+    case "downloading": return (out ? n + " is receiving" : "Receiving") + of + (t.zip ? " (zipping folder)" : "") + "…";
+    case "done":
+      if (out) return "Delivered to " + n;
+      return t.zip ? "Received the folder as a .zip. Check your Downloads folder."
+        : (t.count > 1 ? "Received " + t.count + " files. Check your Downloads folder." : "Received. Check your Downloads folder.");
+    default: return t.note || (t.state === "declined" ? "Declined" : "Cancelled");
+  }
+}
+
+function updateCard(t) {
+  const out = t.frm === me.id, c = cards[t.id] || makeCard(t), live = ACTIVE.includes(t.state);
+  c.title.textContent = (out ? "↑ To " + t.to_name : "↓ From " + t.frm_name);
+  c.sub.textContent = t.count + " file" + (t.count > 1 ? "s" : "") + " · " + fmtSize(t.total) + " — " + t.names.join(", ") + (t.count > t.names.length ? "…" : "");
+  c.pin.hidden = !(out && t.state === "offered");
+  c.pinNum.textContent = t.pin || "";
+  c.pinWho.textContent = "Tell " + t.to_name + " this PIN to accept:";
+  c.stat.textContent = statusOf(t);
+  // Progress tracks bytes delivered end-to-end (t.down); the sender's own feed is t.up.
+  const done = out ? t.up : t.down, total = t.total;
+  const showBar = ["ready", "downloading"].includes(t.state);
+  c.bar.hidden = c.info.hidden = !showBar;
+  const pct = total ? Math.min(100, done / total * 100) : 0;
+  c.fill.style.width = pct.toFixed(1) + "%";
+  const sp = out ? t.sp_up : t.sp_down;
+  let info = fmtSize(done) + " / " + fmtSize(total) + " · " + pct.toFixed(0) + "%";
+  if (sp > 0) info += " · " + (out ? "↑ " : "↓ ") + fmtSize(sp) + "/s · " + fmtTime((total - done) / sp) + " left";
+  c.info.textContent = info;
+  c.btnCancel.hidden = !live;
+  c.btnCancel.textContent = t.state === "offered" && !out ? "Decline" : "Cancel";
+  c.btnSave.hidden = !(!out && t.state === "downloading" && (t.zip || t.count === 1));
+  c.btnX.hidden = live;
+  const cont = out ? $("outList") : $("inList");
+  if (!c.el.parentNode) cont.prepend(c.el);
+}
+
+function makeCard(t) {
+  const c = {};
+  c.title = h("div", { class: "ttl" }); c.sub = h("div", { class: "sub" });
+  c.pinWho = h("span"); c.pinNum = h("b");
+  c.pin = h("div", { class: "pinbox" }, c.pinWho, c.pinNum);
+  c.stat = h("div", { class: "stat" });
+  c.fill = h("i"); c.bar = h("div", { class: "bar" }, c.fill); c.info = h("div", { class: "sub" });
+  c.btnSave = h("button", { onclick: () => saveT(t.id, (tr[t.id] || {}).done || 0) }, "Save");
+  c.btnCancel = h("button", { class: "danger", onclick: () => cancelT(t.id) }, "Cancel");
+  c.btnX = h("button", { class: "ghost", onclick: () => dismiss(t.id) }, "Dismiss");
+  c.el = h("div", { class: "tcard" }, c.title, c.sub, c.pin, c.stat, c.bar, c.info, h("div", { class: "row" }, c.btnSave, c.btnCancel, c.btnX));
+  return cards[t.id] = c;
+}
+
+let ovTid = null;
+function renderOverlay() {
+  const t = Object.values(tr).find(x => x.to === me.id && x.state === "offered");
+  const ov = $("ov");
+  if (!t) { ov.hidden = true; ovTid = null; return; }
+  ov.hidden = false;
+  if (ovTid === t.id) return;
+  ovTid = t.id;
+  const inp = h("input", { id: "pinIn", maxlength: "4", inputmode: "numeric", autocomplete: "off", placeholder: "····" });
+  const accept = () => {
+    if (inp.value.trim().length !== 4) { $("pinErr").textContent = "Enter the 4-digit PIN shown on the sender's screen."; return; }
+    wsend({ type: "accept", tid: t.id, pin: inp.value.trim() });
+  };
+  inp.onkeydown = e => { if (e.key === "Enter") accept(); };
+  inp.oninput = () => { inp.value = inp.value.replace(/\D/g, ""); };
+  ov.replaceChildren(h("div", { class: "box" },
+    h("h2", {}, "Incoming transfer"),
+    h("div", {}, h("b", {}, t.frm_name), " wants to send you ", h("b", {}, t.count + " file" + (t.count > 1 ? "s" : "") + " (" + fmtSize(t.total) + ")")),
+    h("div", { class: "sub", style: "margin-top:6px" }, t.names.join(", ") + (t.count > t.names.length ? "…" : "")),
+    h("div", { class: "hint", style: "margin-top:12px" }, "Enter the PIN shown on " + t.frm_name + "'s screen to accept:"),
+    inp, h("div", { id: "pinErr" }),
+    h("div", { class: "row" }, h("button", { onclick: accept }, "Accept"), h("button", { class: "ghost", onclick: () => cancelT(t.id) }, "Decline"))));
+  inp.focus();
+}
+
+function renderTransfers() {
+  Object.values(tr).forEach(updateCard);
+  renderOverlay();
+  const pending = Object.values(tr).filter(t => t.to === me.id && ACTIVE.includes(t.state)).length;
+  $("badge").hidden = !pending; $("badge").textContent = pending;
+  document.title = (Object.values(tr).some(t => t.to === me.id && t.state === "offered") ? "● Incoming — " : "") + "Healio Transfer";
+}
+
+// ---------- wiring ----------
+function tab(send) {
+  $("paneSend").hidden = !send; $("paneRecv").hidden = send;
+  $("tabSend").classList.toggle("act", send); $("tabRecv").classList.toggle("act", !send);
+}
+$("tabSend").onclick = () => tab(true);
+$("tabRecv").onclick = () => tab(false);
+$("rename").onclick = () => {
+  const n = prompt("Device name", me.name);
+  if (n && n.trim()) { try { localStorage.setItem("name", n.trim()); } catch (e) {} wsend({ type: "rename", name: n.trim() }); }
+};
+$("pickFiles").onclick = () => $("fileInput").click();
+$("pickFolder").onclick = () => $("folderInput").click();
+$("fileInput").onchange = e => { addItems([...e.target.files].map(f => ({ file: f, rel: f.name }))); e.target.value = ""; };
+$("folderInput").onchange = e => { addItems([...e.target.files].map(f => ({ file: f, rel: f.webkitRelativePath || f.name }))); e.target.value = ""; };
+$("sendBtn").onclick = doSend;
+$("clearBtn").onclick = () => { sel = []; renderSend(); };
+const drop = $("drop");
+["dragenter","dragover"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add("over"); }));
+["dragleave","drop"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove("over"); }));
+drop.addEventListener("drop", async e => {
+  const entries = [...e.dataTransfer.items].map(i => i.webkitGetAsEntry && i.webkitGetAsEntry()).filter(Boolean);
+  const out = [];
+  if (entries.length) for (const en of entries) await walk(en, "", out);
+  else for (const f of e.dataTransfer.files) out.push({ file: f, rel: f.name });
+  addItems(out);
+});
+window.addEventListener("dragover", e => e.preventDefault());
+window.addEventListener("drop", e => e.preventDefault());
+
+fetch("/api/info").then(r => r.json()).then(d => $("url").textContent = d.url).catch(() => {});
+renderMe(); renderPeers(); renderSend(); connect();
+</script>
+</body>
+</html>
