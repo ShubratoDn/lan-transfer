@@ -1,4 +1,4 @@
-# Healio LAN Transfer
+# HopDrop
 
 Send files and folders between laptops on the same network. Pick a device,
 the receiver approves with a PIN, and the transfer streams straight through
@@ -27,7 +27,7 @@ If another laptop can't connect, allow the port through Windows Firewall once
 (admin PowerShell):
 
 ```
-New-NetFirewallRule -DisplayName "Healio 8000" -Direction Inbound -Protocol TCP -LocalPort 8000 -Action Allow
+New-NetFirewallRule -DisplayName "HopDrop 8000" -Direction Inbound -Protocol TCP -LocalPort 8000 -Action Allow
 ```
 
 ## Use

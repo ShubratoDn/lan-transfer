@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Healio Transfer</title>
+<title>HopDrop</title>
 <style>
   :root { --bg:#f5f7fa; --card:#fff; --text:#1c2430; --muted:#6b7686; --line:#e1e6ee; --accent:#1f8a70; --danger:#c0392b; --sel:#e6f5f0; }
   @media (prefers-color-scheme: dark) {
@@ -58,7 +58,7 @@
 <body>
 <main>
   <header>
-    <h1>Healio Transfer</h1>
+    <h1>HopDrop</h1>
     <div class="me"><span class="dot" id="dot"></span><span id="meName"></span><button class="ghost" id="rename">Rename</button></div>
   </header>
 
@@ -359,7 +359,7 @@ function renderTransfers() {
   renderOverlay();
   const pending = Object.values(tr).filter(t => t.to === me.id && ACTIVE.includes(t.state)).length;
   $("badge").hidden = !pending; $("badge").textContent = pending;
-  document.title = (Object.values(tr).some(t => t.to === me.id && t.state === "offered") ? "● Incoming — " : "") + "Healio Transfer";
+  document.title = (Object.values(tr).some(t => t.to === me.id && t.state === "offered") ? "● Incoming — " : "") + "HopDrop";
 }
 
 // ---------- wiring ----------

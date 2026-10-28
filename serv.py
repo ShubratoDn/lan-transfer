@@ -1,4 +1,4 @@
-"""Healio LAN transfer: send files/folders to a chosen device on the network.
+"""HopDrop: send files/folders to a chosen device on the network.
 
 Run:  pip install fastapi uvicorn python-multipart websockets
       python serv.py
@@ -255,7 +255,7 @@ async def lifespan(_: FastAPI):
     task.cancel()
 
 
-app = FastAPI(title="Healio Transfer", lifespan=lifespan)
+app = FastAPI(title="HopDrop", lifespan=lifespan)
 
 
 @app.websocket("/ws")
