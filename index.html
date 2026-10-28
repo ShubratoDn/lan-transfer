@@ -52,6 +52,7 @@
   #ov .box { background:var(--card); border-radius:12px; padding:20px; width:100%; max-width:380px; }
   #ov input { width:100%; font-size:28px; text-align:center; letter-spacing:10px; padding:8px; border:2px solid var(--line); border-radius:8px; background:var(--bg); color:var(--text); margin:10px 0 4px; }
   #pinErr { color:var(--danger); font-size:13px; min-height:18px; }
+  .opt { display:flex; align-items:center; gap:8px; margin-top:10px; font-size:14px; }
   #toast { position:fixed; bottom:16px; left:50%; transform:translateX(-50%); background:var(--text); color:var(--bg); padding:8px 14px; border-radius:8px; z-index:20; }
 </style>
 </head>
@@ -100,6 +101,7 @@
     <div class="card">
       <h2>Ready to receive</h2>
       <div>You are visible as <b id="meName2"></b>. Keep this page open; incoming files will ask for your approval and a PIN.</div>
+      <label class="opt"><input type="checkbox" id="directChk"> Connect straight to the sender when the host laptop is a third machine (faster on Wi-Fi; turn off if the host is on Ethernet)</label>
     </div>
     <div class="card">
       <h2>Incoming</h2>
@@ -175,22 +177,28 @@ function onMsg(d) {
   } else if (d.type === "pin_bad") {
     const el = $("pinErr");
     if (el) { el.textContent = "Wrong PIN. " + d.left + " tries left."; $("pinIn").value = ""; $("pinIn").focus(); }
+  } else if (d.type === "signal") {
+    onSignal(d.tid, d.data);
   } else if (d.type === "error") {
     toast(d.msg);
   }
 }
 
 function onTransfer(t) {
+  const live = ACTIVE.includes(t.state), s = rtc[t.id];
+  if (s && !s.closed && (!live || t.relay)) closeDirect(t.id);   // finished, or fell back to the relay
   if (t.frm === me.id) {
-    if (!ACTIVE.includes(t.state)) { if (upctl[t.id]) upctl[t.id].abort(); delete outbox[t.ref]; return; }
-    if ((t.state === "accepted" || (t.relay && ["ready","downloading"].includes(t.state))) && !upctl[t.id]) {
-      if (outbox[t.ref]) startUpload(t);
-      else wsend({ type: "cancel", tid: t.id, reason: "sender page reloaded" });
-    }
+    if (!live) { if (upctl[t.id]) upctl[t.id].abort(); delete outbox[t.ref]; return; }
+    const need = t.relay ? ["ready", "downloading"].includes(t.state) && !upctl[t.id] : !s;
+    if (need && !outbox[t.ref]) wsend({ type: "cancel", tid: t.id, reason: "sender page reloaded" });
+    else if (need) t.relay ? startUpload(t) : startDirect(t);
   }
-  // Receiver: download each file in turn. t.done is how many have arrived; fetch that one next.
-  if (t.to === me.id && ["ready", "downloading"].includes(t.state) && t.done < t.count) {
-    if (dlNext[t.id] !== t.done) { dlNext[t.id] = t.done; saveT(t.id, t.done); }
+  if (t.to === me.id && live) {
+    // Relay: download each file in turn. t.done is how many have arrived; fetch that one next.
+    if (t.relay && ["ready", "downloading"].includes(t.state) && t.done < t.count) {
+      if (dlNext[t.id] !== t.done) { dlNext[t.id] = t.done; saveT(t.id, t.done); }
+    }
+    if (!t.relay && t.state === "downloading" && !s) wsend({ type: "cancel", tid: t.id, reason: "receiver page reloaded" });
   }
 }
 
@@ -238,6 +246,229 @@ async function walk(entry, prefix, out) {
   }
 }
 
+// ---------- direct (WebRTC) ----------
+// Browser to browser over the LAN; the server only passes the handshake along. Streaming straight to
+// disk needs HTTPS, so the receiver collects the data in Blobs (Chromium pages big ones to disk) and
+// saves at the end. Bigger transfers, and connections that can't be made, go through the relay.
+const MB = 1 << 20, GB = 1 << 30;
+const DIRECT_MAX = /Chrome\//.test(navigator.userAgent) ? 8 * GB : 1 * GB;   // Chrome, Edge, Opera
+const MSG = 64 * 1024, READ = 4 * MB, HIGH = 8 * MB, LOW = 2 * MB, FLUSH = 16 * MB, CONNECT_MS = 10000;
+const rtc = {};   // tid -> session; closed sessions stay so they are not restarted
+
+function directOn() { try { return localStorage.getItem("direct") !== "0"; } catch (e) { return true; } }
+function canDirect(t) { return directOn() && !!window.RTCPeerConnection && t.total <= DIRECT_MAX; }
+
+function newPeer(tid) {
+  const s = { pc: new RTCPeerConnection({ iceServers: [] }), cands: [], closed: false, moved: false, fin: false };
+  s.pc.onicecandidate = e => { if (e.candidate) wsend({ type: "signal", tid, data: { cand: e.candidate.toJSON() } }); };
+  s.pc.onconnectionstatechange = () => { if (s.pc.connectionState === "failed") directLost(tid); };
+  return rtc[tid] = s;
+}
+
+function closeDirect(tid) {
+  const s = rtc[tid]; if (!s || s.closed) return;
+  s.closed = true; clearTimeout(s.timer); clearInterval(s.rep);
+  s.pend = s.parts = s.zip = null;
+  try { s.pc.close(); } catch (e) {}
+}
+
+// Before any data has moved the relay can take over; after that a broken link ends the transfer.
+function directLost(tid) {
+  const s = rtc[tid], t = tr[tid];
+  if (!s || s.closed || s.fin) return;
+  closeDirect(tid);
+  if (!t || !ACTIVE.includes(t.state)) return;
+  if (t.state === "accepted" && !s.moved) wsend({ type: "fallback", tid });
+  else wsend({ type: "cancel", tid, reason: "direct connection lost" });
+}
+
+async function onSignal(tid, data) {
+  const t = tr[tid];
+  if (!t || t.relay || !ACTIVE.includes(t.state) || !data) return;
+  let s = rtc[tid];
+  try {
+    if (data.sdp) {
+      if (!s && t.to === me.id) { s = newPeer(tid); s.pc.ondatachannel = e => recvChannel(tid, s, e.channel); }
+      if (!s || s.closed) return;
+      await s.pc.setRemoteDescription(data.sdp);
+      for (const c of s.cands.splice(0)) await s.pc.addIceCandidate(c);
+      if (data.sdp.type === "offer") {
+        await s.pc.setLocalDescription(await s.pc.createAnswer());
+        wsend({ type: "signal", tid, data: { sdp: s.pc.localDescription } });
+      }
+    } else if (data.cand && s && !s.closed) {
+      if (s.pc.remoteDescription) await s.pc.addIceCandidate(data.cand); else s.cands.push(data.cand);
+    }
+  } catch (e) { directLost(tid); }
+}
+
+async function startDirect(t) {
+  const s = newPeer(t.id), items = outbox[t.ref], dc = s.pc.createDataChannel("hopdrop");
+  dc.binaryType = "arraybuffer";
+  s.timer = setTimeout(() => { if (dc.readyState !== "open") directLost(t.id); }, CONNECT_MS);
+  dc.onopen = () => { clearTimeout(s.timer); pump(t.id, s, dc, items); };
+  dc.onclose = () => directLost(t.id);
+  try {
+    await s.pc.setLocalDescription(await s.pc.createOffer());
+    wsend({ type: "signal", tid: t.id, data: { sdp: s.pc.localDescription } });
+  } catch (e) { directLost(t.id); }
+}
+
+// Sender: a JSON manifest, then every file's bytes back to back; sizes mark where each file ends.
+async function pump(tid, s, dc, items) {
+  let sent = 0, last = 0;
+  dc.bufferedAmountLowThreshold = LOW;
+  try {
+    dc.send(JSON.stringify({ files: items.map(it => ({ name: it.rel, size: it.file.size })) }));
+    for (const it of items) {
+      for (let off = 0; off < it.file.size; off += READ) {
+        const buf = await it.file.slice(off, off + READ).arrayBuffer();
+        for (let p = 0; p < buf.byteLength; p += MSG) {
+          if (dc.bufferedAmount > HIGH) await new Promise(r => dc.addEventListener("bufferedamountlow", r, { once: true }));
+          if (s.closed) return;
+          const n = Math.min(MSG, buf.byteLength - p);
+          dc.send(new Uint8Array(buf, p, n));
+          sent += n; s.moved = true;
+          if (performance.now() - last > 300) {
+            last = performance.now();
+            wsend({ type: "progress", tid, up: Math.max(0, sent - dc.bufferedAmount) });
+          }
+        }
+      }
+    }
+    s.fin = true;   // the receiver reports completion; its side notices a broken link from here on
+  } catch (e) { directLost(tid); }
+}
+
+function recvChannel(tid, s, dc) {
+  dc.binaryType = "arraybuffer";
+  dc.onclose = () => directLost(tid);
+  dc.onmessage = e => {
+    try { onChunk(tid, s, e.data); }
+    catch (err) { closeDirect(tid); wsend({ type: "cancel", tid, reason: "bad data from sender" }); }
+  };
+}
+
+function onChunk(tid, s, d) {
+  const t = tr[tid];
+  if (s.closed || !t) return;
+  if (typeof d === "string") {
+    const files = JSON.parse(d).files;
+    if (s.files || !Array.isArray(files) || files.length !== t.count ||
+        files.some(f => !(Number.isSafeInteger(f.size) && f.size >= 0)) ||
+        files.reduce((a, f) => a + f.size, 0) !== t.total) throw new Error("manifest");
+    s.files = files.map(f => ({ name: cleanRel(f.name) || "file", size: f.size }));
+    Object.assign(s, { cur: 0, got: 0, down: 0, done: 0, crc: 0, pend: [], pendN: 0, parts: [], zip: t.zip ? zipper() : null });
+    s.rep = setInterval(() => wsend({ type: "progress", tid, down: s.down, done: s.done }), 300);
+    nextFile(tid, s);
+    return;
+  }
+  if (!s.files || s.cur >= s.files.length) throw new Error("unexpected data");
+  const u8 = new Uint8Array(d);
+  s.got += u8.length; s.down += u8.length; s.moved = true;
+  if (s.got > s.files[s.cur].size) throw new Error("file too long");
+  if (s.zip) s.crc = crc32(s.crc, u8);
+  s.pend.push(d); s.pendN += u8.length;
+  if (s.pendN >= FLUSH) flushPend(s);   // small Blobs merged into big ones let the browser page them to disk
+  if (s.got === s.files[s.cur].size) { fileDone(s); nextFile(tid, s); }
+}
+
+function flushPend(s) { if (s.pendN) { s.parts.push(new Blob(s.pend)); s.pend = []; s.pendN = 0; } }
+
+function fileDone(s) {
+  flushPend(s);
+  const f = s.files[s.cur];
+  if (s.zip) s.zip.add(f.name, s.crc, f.size, s.parts);
+  else saveBlob(new Blob(s.parts), f.name.split("/").pop());
+  s.parts = []; s.crc = 0; s.got = 0; s.cur++; s.done++;
+}
+
+function nextFile(tid, s) {
+  while (s.cur < s.files.length && s.files[s.cur].size === 0) fileDone(s);
+  if (s.cur < s.files.length) return;
+  if (s.zip) saveBlob(s.zip.finish(), tr[tid].out_name || "files.zip");
+  s.fin = true; clearInterval(s.rep);
+  wsend({ type: "complete", tid });   // the connection closes when the server confirms
+}
+
+function saveBlob(blob, name) {
+  const url = URL.createObjectURL(blob), a = h("a", { href: url, download: name });
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5 * 60000);
+}
+
+function cleanRel(name) {
+  return String(name).split(/[\\/]+/).filter(p => p && p !== "." && p !== "..")
+    .map(p => p.replace(/[<>:"|?*\x00-\x1f]/g, "_").slice(0, 200)).join("/");
+}
+
+const CRC = new Int32Array(256).map((_, n) => {
+  let c = n;
+  for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+  return c;
+});
+function crc32(crc, u8) {
+  crc = ~crc;
+  for (let i = 0; i < u8.length; i++) crc = CRC[(crc ^ u8[i]) & 255] ^ (crc >>> 8);
+  return ~crc;
+}
+
+// Uncompressed zip, same as the relay's. Each entry is added once its CRC is known, so headers carry
+// real values (no data descriptors); ZIP64 fields appear only where a size or offset needs them.
+function zipper() {
+  const parts = [], cd = [], te = new TextEncoder(), M32 = 0xFFFFFFFF, d = new Date();
+  const time = d.getHours() << 11 | d.getMinutes() << 5 | d.getSeconds() >> 1;
+  const date = (d.getFullYear() - 1980) << 9 | (d.getMonth() + 1) << 5 | d.getDate();
+  const rec = n => { const b = new Uint8Array(n); return [b, new DataView(b.buffer)]; };
+  const u64 = (v, o, x) => { v.setUint32(o, x % 2 ** 32, true); v.setUint32(o + 4, Math.floor(x / 2 ** 32), true); };
+  let off = 0;
+  return {
+    add(name, crc, size, data) {
+      const nb = te.encode(name), big = size >= M32, [b, v] = rec(30 + nb.length + (big ? 20 : 0));
+      v.setUint32(0, 0x04034b50, true); v.setUint16(4, big ? 45 : 20, true); v.setUint16(6, 0x800, true);
+      v.setUint16(10, time, true); v.setUint16(12, date, true); v.setUint32(14, crc >>> 0, true);
+      v.setUint32(18, big ? M32 : size, true); v.setUint32(22, big ? M32 : size, true);
+      v.setUint16(26, nb.length, true); v.setUint16(28, big ? 20 : 0, true); b.set(nb, 30);
+      if (big) { const o = 30 + nb.length; v.setUint16(o, 1, true); v.setUint16(o + 2, 16, true); u64(v, o + 4, size); u64(v, o + 12, size); }
+      parts.push(b, ...data);
+      cd.push({ nb, crc, size, off });
+      off += b.length + size;
+    },
+    finish() {
+      const start = off, tail = [];
+      for (const e of cd) {
+        const x = [];
+        if (e.size >= M32) x.push(e.size, e.size);
+        if (e.off >= M32) x.push(e.off);
+        const xl = x.length ? 4 + 8 * x.length : 0, [b, v] = rec(46 + e.nb.length + xl);
+        v.setUint32(0, 0x02014b50, true); v.setUint16(4, 45, true); v.setUint16(6, xl ? 45 : 20, true);
+        v.setUint16(8, 0x800, true); v.setUint16(12, time, true); v.setUint16(14, date, true);
+        v.setUint32(16, e.crc >>> 0, true); v.setUint32(20, Math.min(e.size, M32), true); v.setUint32(24, Math.min(e.size, M32), true);
+        v.setUint16(28, e.nb.length, true); v.setUint16(30, xl, true); v.setUint32(42, Math.min(e.off, M32), true);
+        b.set(e.nb, 46);
+        if (xl) {
+          const o = 46 + e.nb.length; v.setUint16(o, 1, true); v.setUint16(o + 2, 8 * x.length, true);
+          x.forEach((n, k) => u64(v, o + 4 + 8 * k, n));
+        }
+        tail.push(b); off += b.length;
+      }
+      const size = off - start, n = cd.length;
+      if (n >= 0xFFFF || start >= M32 || size >= M32) {
+        const [b, v] = rec(76);   // ZIP64 end record + locator
+        v.setUint32(0, 0x06064b50, true); u64(v, 4, 44); v.setUint16(12, 45, true); v.setUint16(14, 45, true);
+        u64(v, 24, n); u64(v, 32, n); u64(v, 40, size); u64(v, 48, start);
+        v.setUint32(56, 0x07064b50, true); u64(v, 64, off); v.setUint32(72, 1, true);
+        tail.push(b);
+      }
+      const [b, v] = rec(22);
+      v.setUint32(0, 0x06054b50, true); v.setUint16(8, Math.min(n, 0xFFFF), true); v.setUint16(10, Math.min(n, 0xFFFF), true);
+      v.setUint32(12, Math.min(size, M32), true); v.setUint32(16, Math.min(start, M32), true);
+      tail.push(b);
+      return new Blob(parts.concat(tail), { type: "application/zip" });
+    },
+  };
+}
+
 // ---------- receiving ----------
 function saveT(tid, i) {
   const t = tr[tid]; if (!t) return;
@@ -278,12 +509,12 @@ function statusOf(t) {
   const of = (!t.zip && t.count > 1) ? " (file " + Math.min(t.done + 1, t.count) + " of " + t.count + ")" : "";
   switch (t.state) {
     case "offered": return out ? "Waiting for " + n + " to accept…" : "Waiting for your approval";
-    case "accepted": return out ? "Starting…" : "Accepted. Waiting for the sender…";
+    case "accepted": return "Connecting directly to " + n + "…";
     case "ready": return out ? "Waiting for " + n + " to start the download…" : "Ready. Starting download…";
-    case "downloading": return (out ? n + " is receiving" : "Receiving") + of + (t.zip ? " (zipping folder)" : "") + "…";
+    case "downloading": return (out ? n + " is receiving" : "Receiving") + of + (t.zip ? " (as a .zip)" : "") + "…";
     case "done":
       if (out) return "Delivered to " + n;
-      return t.zip ? "Received the folder as a .zip. Check your Downloads folder."
+      return t.zip ? "Received as " + t.out_name + ". Check your Downloads folder."
         : (t.count > 1 ? "Received " + t.count + " files. Check your Downloads folder." : "Received. Check your Downloads folder.");
     default: return t.note || (t.state === "declined" ? "Declined" : "Cancelled");
   }
@@ -306,10 +537,11 @@ function updateCard(t) {
   const sp = out ? t.sp_up : t.sp_down;
   let info = fmtSize(done) + " / " + fmtSize(total) + " · " + pct.toFixed(0) + "%";
   if (sp > 0) info += " · " + (out ? "↑ " : "↓ ") + fmtSize(sp) + "/s · " + fmtTime((total - done) / sp) + " left";
-  c.info.textContent = info;
+  c.info.textContent = info + (t.relay ? " · via host" : " · direct");
   c.btnCancel.hidden = !live;
   c.btnCancel.textContent = t.state === "offered" && !out ? "Decline" : "Cancel";
-  c.btnSave.hidden = !(!out && t.state === "downloading" && (t.zip || t.count === 1));
+  // Only before the server sees the download: if the browser blocked it, this retries it.
+  c.btnSave.hidden = !(!out && t.relay && t.state === "ready");
   c.btnX.hidden = live;
   const cont = out ? $("outList") : $("inList");
   if (!c.el.parentNode) cont.prepend(c.el);
@@ -340,7 +572,7 @@ function renderOverlay() {
   const inp = h("input", { id: "pinIn", maxlength: "4", inputmode: "numeric", autocomplete: "off", placeholder: "····" });
   const accept = () => {
     if (inp.value.trim().length !== 4) { $("pinErr").textContent = "Enter the 4-digit PIN shown on the sender's screen."; return; }
-    wsend({ type: "accept", tid: t.id, pin: inp.value.trim() });
+    wsend({ type: "accept", tid: t.id, pin: inp.value.trim(), direct: canDirect(t) });
   };
   inp.onkeydown = e => { if (e.key === "Enter") accept(); };
   inp.oninput = () => { inp.value = inp.value.replace(/\D/g, ""); };
@@ -377,6 +609,8 @@ $("pickFiles").onclick = () => $("fileInput").click();
 $("pickFolder").onclick = () => $("folderInput").click();
 $("fileInput").onchange = e => { addItems([...e.target.files].map(f => ({ file: f, rel: f.name }))); e.target.value = ""; };
 $("folderInput").onchange = e => { addItems([...e.target.files].map(f => ({ file: f, rel: f.webkitRelativePath || f.name }))); e.target.value = ""; };
+$("directChk").checked = directOn();
+$("directChk").onchange = e => { try { localStorage.setItem("direct", e.target.checked ? "1" : "0"); } catch (err) {} };
 $("sendBtn").onclick = doSend;
 $("clearBtn").onclick = () => { sel = []; renderSend(); };
 const drop = $("drop");

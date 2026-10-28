@@ -1,21 +1,20 @@
 """HopDrop: send files/folders to a chosen device on the network.
 
-Run:  pip install fastapi uvicorn python-multipart websockets
+Run:  pip install -r requirements.txt
       python serv.py
 Open the printed URL on every laptop (including this one). Each open page shows
 up as a device; pick one, choose files/folders, and the receiver must accept
 with the PIN shown on the sender's screen.
 
-Files are streamed straight from sender to receiver through this laptop and are
+Files go straight from browser to browser over WebRTC when possible; this laptop
+then only introduces the two. Otherwise they are relayed through this laptop and
 never written to its disk, so any size works regardless of free space here.
-A folder (or several files) is zipped on the fly as it streams.
+A folder (or more than a few files) is delivered as one zip built on the fly.
 """
 import asyncio
-import queue
 import re
 import secrets
 import socket
-import threading
 import time
 import zipfile
 from contextlib import asynccontextmanager
@@ -27,12 +26,13 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import HTMLResponse, StreamingResponse
 
 PORT = 8000
-CHUNK = 256 * 1024
-QDEPTH = 32          # chunks buffered each side of the relay (~8 MB) for backpressure
+QDEPTH = 32          # chunks buffered each side of the relay for backpressure
+LOOSE_MAX = 5        # more loose files than this are delivered as one zip
 MAX_TRIES = 3        # wrong PIN attempts before the offer is dropped
 GRACE = 15           # seconds a device may be offline before its transfers are cancelled
 KEEP = 60            # seconds finished transfers stay on the server
 READY_WAIT = 300     # seconds to wait for the receiver to start downloading
+DIRECT_WAIT = 25     # seconds a direct connection may take to deliver data before falling back to the relay
 ACTIVE = {"offered", "accepted", "ready", "downloading"}
 
 
@@ -41,6 +41,7 @@ class Peer:
         self.id = pid
         self.name = ""
         self.ws: WebSocket | None = None
+        self.ip = ""
         self.off = time.time()
 
 
@@ -53,25 +54,28 @@ class Transfer:
         self.skey = secrets.token_urlsafe(12)   # sender's upload key
         self.rkey = secrets.token_urlsafe(12)   # receiver's download key
         self.state, self.note, self.tries = "offered", "", 0
+        self.relay = True                       # False while the browsers talk directly (WebRTC)
         self.up = self.down = 0
-        self.down_total = self.total
         self.sp_up = self.sp_down = 0.0
         self.last = (time.time(), 0, 0)
         self.ended: float | None = None
         self.dirty = False
         self.done = 0                           # files fully delivered to the receiver
         self.started = False                    # receiver has begun downloading
-        # A folder (any path with "/") is delivered as one streaming zip; loose files go one-by-one.
-        self.zip = any("/" in f["name"] for f in files)
-        self.out_name = ""
-        self.feed: queue.Queue | None = None    # zip mode: sender chunks -> zip builder thread
-        self.out_q: queue.Queue | None = None   # zip mode: zip bytes -> receiver
-        self.qs: dict[int, queue.Queue] = {}    # file mode: one relay queue per file
+        # A folder (any path with "/") or many loose files is delivered as one streaming zip.
+        self.zip = len(files) > LOOSE_MAX or any("/" in f["name"] for f in files)
+        self.out_name = zip_name(self) if self.zip else ""
+        self.zf: zipfile.ZipFile | None = None  # zip mode: writer feeding zbuf
+        self.zbuf: list[bytes] = []             # zip mode: bytes written but not yet queued
+        self.next_up = 0                        # zip mode: index of the file the zip expects next
+        self.up_busy = False
+        self.out_q: asyncio.Queue | None = None # zip mode: zip bytes -> receiver
+        self.qs: dict[int, asyncio.Queue] = {}  # file mode: one relay queue per file
         self.since = time.time()
 
-    def q(self, i: int) -> queue.Queue:
+    def q(self, i: int) -> asyncio.Queue:
         if i not in self.qs:
-            self.qs[i] = queue.Queue(maxsize=QDEPTH)
+            self.qs[i] = asyncio.Queue(maxsize=QDEPTH)
         return self.qs[i]
 
 
@@ -88,6 +92,24 @@ def get_lan_ip() -> str:
         return "127.0.0.1"
     finally:
         s.close()
+
+
+def host_ips() -> set[str]:
+    ips = {"127.0.0.1", "::1", get_lan_ip()}
+    try:
+        ips.update(socket.gethostbyname_ex(socket.gethostname())[2])
+    except OSError:
+        pass
+    return ips
+
+
+LOCAL_IPS = host_ips()
+
+
+def worth_direct(t: Transfer) -> bool:
+    """Browser-to-browser only pays off when the relay costs two network hops, i.e. when this
+    laptop is neither sender nor receiver. WebRTC is also slower per hop than plain HTTP."""
+    return all(peers[pid].ip not in LOCAL_IPS for pid in (t.frm, t.to) if pid in peers)
 
 
 def clean_rel(name) -> str:
@@ -110,11 +132,18 @@ def pname(pid: str) -> str:
     return p.name if p else "?"
 
 
+def zip_name(t: Transfer) -> str:
+    """A friendly download name for the single zip a folder transfer produces."""
+    tops = {f["name"].split("/")[0] for f in t.files}
+    nested = all("/" in f["name"] for f in t.files)
+    return (tops.pop() if nested and len(tops) == 1 else f"{pname(t.frm)}-files") + ".zip"
+
+
 def summary(t: Transfer, viewer: str) -> dict:
     d = dict(
         id=t.id, ref=t.ref, frm=t.frm, to=t.to, frm_name=pname(t.frm), to_name=pname(t.to),
-        state=t.state, note=t.note, relay=True, zip=t.zip, count=len(t.files), total=t.total, done=t.done,
-        up=t.up, down=t.down, down_total=t.down_total,
+        state=t.state, note=t.note, relay=t.relay, zip=t.zip, out_name=t.out_name,
+        count=len(t.files), total=t.total, done=t.done, up=t.up, down=t.down,
         sp_up=round(t.sp_up), sp_down=round(t.sp_down),
         names=[f["name"] for f in t.files[:6]],
     )
@@ -157,18 +186,46 @@ def finish(t: Transfer, state: str, note: str = ""):
     t.state, t.note, t.ended = state, note, time.time()
     t.sp_up = t.sp_down = 0.0
     t.dirty = True
-    # Nudge any blocked relay threads so they notice the state change and exit.
-    for q in (t.feed, t.out_q, *t.qs.values()):
+    # Nudge any waiting relay handlers so they notice the state change and exit.
+    for q in (t.out_q, *t.qs.values()):
         if q is not None:
             try:
                 q.put_nowait(None)
-            except queue.Full:
+            except asyncio.QueueFull:
                 pass
 
 
 async def end(t: Transfer, state: str, note: str = ""):
     finish(t, state, note)
     await push(t)
+
+
+class ZipSink:
+    """Non-seekable target, so zipfile emits streaming data descriptors; bytes collect in t.zbuf."""
+    def __init__(self, t: Transfer):
+        self.t = t
+
+    def write(self, b):
+        self.t.zbuf.append(bytes(b))
+        return len(b)
+
+    def flush(self):
+        pass
+
+
+def use_relay(t: Transfer):
+    """Switch an accepted transfer to the relay through this laptop."""
+    t.relay, t.state, t.since = True, "ready", time.time()
+    t.up = t.down = t.done = 0
+    t.sp_up = t.sp_down = 0.0
+    if t.zip:
+        t.zbuf.clear()
+        t.zf = zipfile.ZipFile(ZipSink(t), "w", zipfile.ZIP_STORED, allowZip64=True)
+        t.out_q = asyncio.Queue(maxsize=QDEPTH)
+
+
+def as_int(v, hi: int) -> int | None:
+    return min(v, hi) if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None
 
 
 async def handle(p: Peer, m: dict):
@@ -194,13 +251,13 @@ async def handle(p: Peer, m: dict):
     t = transfers.get(m.get("tid"))
     if not t or p.id not in (t.frm, t.to):
         return
+    direct = not t.relay and t.state in ("accepted", "downloading")
     if ty == "accept" and p.id == t.to and t.state == "offered":
         if secrets.compare_digest(str(m.get("pin", "")).strip(), t.pin):
-            if t.zip:
-                t.feed = queue.Queue(maxsize=QDEPTH)
-                t.out_q = queue.Queue(maxsize=QDEPTH)
-                t.out_name = zip_name(t)
-            t.state, t.since = "ready", time.time()
+            if m.get("direct") is True and worth_direct(t):   # sender starts WebRTC
+                t.relay, t.state, t.since = False, "accepted", time.time()
+            else:
+                use_relay(t)
             await push(t)
         else:
             t.tries += 1
@@ -213,6 +270,29 @@ async def handle(p: Peer, m: dict):
     elif ty == "cancel" and t.state in ACTIVE:
         why = str(m.get("reason", ""))[:60]
         await end(t, "cancelled", f"Cancelled by {p.name}" + (f" ({why})" if why else ""))
+    elif ty == "signal" and direct and isinstance(m.get("data"), dict):
+        # WebRTC offer/answer/ICE candidates, passed between the two browsers only.
+        await send(t.to if p.id == t.frm else t.frm, {"type": "signal", "tid": t.id, "data": m["data"]})
+    elif ty == "progress" and direct:
+        # In direct mode the bytes never pass through here, so each side reports its own count.
+        if p.id == t.frm:
+            up = as_int(m.get("up"), t.total)
+            if up is not None:
+                t.up = max(t.up, up)
+        else:
+            down, done = as_int(m.get("down"), t.total), as_int(m.get("done"), len(t.files))
+            if down is not None:
+                t.down = max(t.down, down)
+            if done is not None:
+                t.done = max(t.done, done)
+            if t.state == "accepted" and t.down > 0:
+                t.state, t.started, t.dirty = "downloading", True, True
+    elif ty == "complete" and direct and p.id == t.to:
+        t.up, t.down, t.done = t.total, t.total, len(t.files)
+        await end(t, "done")
+    elif ty == "fallback" and direct and t.state == "accepted":
+        use_relay(t)
+        await push(t)
 
 
 async def ticker():
@@ -236,6 +316,9 @@ async def ticker():
                         break
                 if t.state == "ready" and now - t.since > READY_WAIT:
                     finish(t, "cancelled", "Receiver never started the download")
+                if t.state == "accepted" and not t.relay and now - t.since > DIRECT_WAIT:
+                    use_relay(t)
+                    t.dirty = True
                 if t.state in ("ready", "downloading") or t.dirty:
                     await push(t)
             elif t.dirty:
@@ -265,6 +348,7 @@ async def ws_endpoint(ws: WebSocket, id: str, name: str = ""):
     p = peers.get(pid) or Peer(pid)
     peers[pid] = p
     old, p.ws = p.ws, ws
+    p.ip = ws.client.host if ws.client else ""
     if old:
         try:
             await old.close()
@@ -286,103 +370,85 @@ async def ws_endpoint(ws: WebSocket, id: str, name: str = ""):
             await broadcast_peers()
 
 
-def zip_name(t: Transfer) -> str:
-    """A friendly download name for the single zip a folder transfer produces."""
-    tops = {f["name"].split("/")[0] for f in t.files}
-    nested = all("/" in f["name"] for f in t.files)
-    return (tops.pop() if nested and len(tops) == 1 else f"{pname(t.frm)}-files") + ".zip"
+_WAIT = object()
 
 
-class _Stop(Exception):
-    """Raised inside the zip thread to unwind when the transfer is cancelled."""
-
-
-async def qput(t: Transfer, q: queue.Queue, item):
-    """Hand an item to a relay queue from async code, giving up if the transfer ends."""
+async def qput(t: Transfer, q: asyncio.Queue, item):
+    """Hand an item to a relay queue, giving up if the transfer ends."""
     while t.state in ACTIVE:
-        try:
-            await asyncio.to_thread(q.put, item, True, 0.5)
+        if not q.full():
+            q.put_nowait(item)
             return
-        except queue.Full:
+        try:
+            await asyncio.wait_for(q.put(item), 0.5)
+            return
+        except asyncio.TimeoutError:
             pass
     raise HTTPException(409, "Cancelled")
 
 
-def zip_worker(t: Transfer):
-    """Thread: read file chunks from t.feed, write a streaming zip into t.out_q. No disk."""
-    class Sink:                       # non-seekable, so zipfile emits streaming data descriptors
-        def write(self, b):
-            data = bytes(b)
-            while t.state in ACTIVE:
-                try:
-                    t.out_q.put(data, True, 0.5)
-                    return len(b)
-                except queue.Full:
-                    pass
-            raise _Stop()
-
-        def flush(self):
-            pass
-
-    entry = None
+async def qget(q: asyncio.Queue):
+    """Next item from a relay queue, or _WAIT after 0.5s so the caller can re-check the state."""
+    if not q.empty():
+        return q.get_nowait()
     try:
-        with zipfile.ZipFile(Sink(), "w", zipfile.ZIP_STORED, allowZip64=True) as z:
-            done = 0
-            while done < len(t.files):
-                if t.state not in ACTIVE:
-                    raise _Stop()
-                try:
-                    item = t.feed.get(True, 0.5)
-                except queue.Empty:
-                    continue
-                if item is None:                  # cancellation sentinel from finish()
-                    raise _Stop()
-                kind = item[0]
-                if kind == "name":
-                    entry = z.open(zipfile.ZipInfo(item[1]), "w", force_zip64=True)
-                elif kind == "data":
-                    entry.write(item[1])
-                elif kind == "eof":
-                    entry.close()
-                    entry = None
-                    done += 1
-    except (_Stop, Exception):
-        pass
-    finally:
-        if entry is not None:
-            try:
-                entry.close()
-            except Exception:
-                pass
-        try:
-            t.out_q.put(None, True, 0.5)          # signal end-of-stream to the receiver
-        except Exception:
-            pass
+        return await asyncio.wait_for(q.get(), 0.5)
+    except asyncio.TimeoutError:
+        return _WAIT
+
+
+async def flush_zip(t: Transfer):
+    if t.zbuf:
+        data = b"".join(t.zbuf)
+        t.zbuf.clear()
+        await qput(t, t.out_q, data)
 
 
 @app.post("/api/up/{tid}/{i}")
 async def upload(tid: str, i: int, key: str, request: Request):
-    """Stream one file's bytes from the sender: into the zip builder, or into that file's queue."""
+    """Stream one file's bytes from the sender: into the zip, or into that file's queue."""
     t = transfers.get(tid)
     if not t or not secrets.compare_digest(key, t.skey):
         raise HTTPException(404, "Unknown transfer")
-    if t.state not in ("ready", "downloading") or not 0 <= i < len(t.files):
+    if not t.relay or t.state not in ("ready", "downloading") or not 0 <= i < len(t.files):
         raise HTTPException(409, "Transfer not accepting data")
-    q = t.feed if t.zip else t.q(i)
+    if t.zip and (t.up_busy or i != t.next_up):
+        raise HTTPException(409, "Files must arrive in order")   # zip entries are written in sequence
     try:
         if t.zip:
-            await qput(t, q, ("name", t.files[i]["name"]))   # tells the zip thread which entry starts
-        async for chunk in request.stream():
-            if t.state not in ACTIVE:
-                raise HTTPException(409, "Cancelled")
-            t.up += len(chunk)
-            await qput(t, q, ("data", chunk) if t.zip else chunk)
-        await qput(t, q, ("eof",) if t.zip else None)        # end-of-file marker
+            t.up_busy = True
+            f = t.files[i]
+            info = zipfile.ZipInfo(f["name"], time.localtime()[:6])
+            info.file_size = f["size"]                          # lets zipfile skip ZIP64 for small files
+            entry = t.zf.open(info, "w")
+            async for chunk in request.stream():
+                if t.state not in ACTIVE:
+                    raise HTTPException(409, "Cancelled")
+                t.up += len(chunk)
+                entry.write(chunk)
+                await flush_zip(t)
+            entry.close()
+            t.next_up += 1
+            if t.next_up == len(t.files):
+                t.zf.close()                                    # writes the central directory
+            await flush_zip(t)
+            if t.next_up == len(t.files):
+                await qput(t, t.out_q, None)                    # end of the zip
+        else:
+            q = t.q(i)
+            async for chunk in request.stream():
+                if t.state not in ACTIVE:
+                    raise HTTPException(409, "Cancelled")
+                t.up += len(chunk)
+                await qput(t, q, chunk)
+            await qput(t, q, None)                              # end-of-file marker
     except HTTPException:
         raise
     except Exception:
         await end(t, "cancelled", "Sender connection lost")
         raise HTTPException(499, "Sender connection lost")
+    finally:
+        t.up_busy = False
     return {"ok": True}
 
 
@@ -392,22 +458,21 @@ async def download(tid: str, i: int, key: str):
     t = transfers.get(tid)
     if not t or not secrets.compare_digest(key, t.rkey):
         raise HTTPException(404, "Unknown transfer")
-    if t.state not in ("ready", "downloading") or not 0 <= i < len(t.files):
+    if not t.relay or t.state not in ("ready", "downloading") or not 0 <= i < len(t.files):
         raise HTTPException(409, "Not ready")
+    if t.zip and t.started:
+        raise HTTPException(409, "Already downloading")         # a second reader would split the zip
     if not t.started:
         t.state, t.started, t.since = "downloading", True, time.time()
         await push(t)
 
     if t.zip:
-        threading.Thread(target=zip_worker, args=(t,), daemon=True).start()
-
         async def gen():
             done = False
             try:
                 while t.state in ACTIVE:
-                    try:
-                        b = await asyncio.to_thread(t.out_q.get, True, 0.5)
-                    except queue.Empty:
+                    b = await qget(t.out_q)
+                    if b is _WAIT:
                         continue
                     if b is None:
                         done = True
@@ -429,9 +494,8 @@ async def download(tid: str, i: int, key: str):
             got = 0
             try:
                 while t.state in ACTIVE:
-                    try:
-                        b = await asyncio.to_thread(q.get, True, 0.5)
-                    except queue.Empty:
+                    b = await qget(q)
+                    if b is _WAIT:
                         continue
                     if b is None:
                         break
@@ -479,6 +543,6 @@ if __name__ == "__main__":
         try:
             import wsproto  # noqa: F401
         except ImportError:
-            raise SystemExit("WebSocket support missing. Run:  pip install websockets")
+            raise SystemExit("WebSocket support missing. Run:  pip install -r requirements.txt")
     print(f"\nOpen on every laptop: http://{get_lan_ip()}:{PORT}/\n")
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")

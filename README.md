@@ -1,11 +1,12 @@
 # HopDrop
 
 Send files and folders between laptops on the same network. Pick a device,
-the receiver approves with a PIN, and the transfer streams straight through
-the host laptop — nothing is written to its disk, so any size works.
+the receiver approves with a PIN, and the transfer streams through the host
+laptop (nothing is written to its disk, so any size works) or, when that would
+be slower, goes straight from browser to browser.
 
-- **Folder** → delivered as one `.zip` (folder structure preserved).
-- **Loose files** → one download each.
+- **Folder, or more than 5 files** → delivered as one `.zip` (folder structure preserved).
+- **Up to 5 loose files** → one download each.
 
 ## Files
 
@@ -35,20 +36,32 @@ New-NetFirewallRule -DisplayName "HopDrop 8000" -Direction Inbound -Protocol TCP
 1. **Send** tab: pick a device, choose files or a folder, click Send.
 2. The sender sees a 4-digit PIN. The receiver gets a popup and types that PIN.
 3. Both sides see progress, speed, time left, and a Cancel button.
-4. A folder arrives as one `.zip`; several loose files arrive as separate
-   downloads (the browser asks to allow multiple downloads once).
+4. A folder (or more than 5 files) arrives as one `.zip`; up to 5 loose files
+   arrive as separate downloads (the browser asks to allow multiple downloads once).
+5. Each transfer shows whether it went **direct** or **via host**.
 
 ## Speed tips
 
-Every byte goes sender → host laptop → receiver, so it crosses the network
-twice. The relay itself is not the bottleneck (it handles well over 150 MB/s
-on one machine); the network is.
+Through the host, every byte goes sender → host laptop → receiver. When the
+host is a third laptop, that crosses the network twice.
 
+- **Direct mode (automatic).** When the host is neither the sender nor the
+  receiver, the two browsers connect to each other directly over WebRTC, and
+  the host only introduces them. On Wi-Fi this skips the extra hop. Browser
+  WebRTC tops out around 15–20 MB/s, though, so it is only used in that
+  third-machine case. If the connection can't be made within ~10 s, HopDrop
+  quietly falls back to the host.
+  - The receiver collects the data in the browser and saves it at the end
+    (saving to disk as it arrives needs HTTPS). It therefore needs free disk
+    space for about twice the transfer. Transfers over 8 GB in Chrome/Edge, or
+    over 1 GB in other browsers, always go via the host.
+  - If the host is plugged into Ethernet, untick "Connect straight to the
+    sender" on the receiving laptop's Receive tab: via the host is faster then.
 - **Run `serv.py` on the sending or receiving laptop.** One leg then stays
   inside that machine, which roughly doubles speed on Wi-Fi.
 - **Plug the host into Ethernet**, or use 5 GHz Wi-Fi close to the router.
-- **Send many files as a folder.** It streams as one continuous zip instead of
-  one download per file.
+- **Many small files** are zipped automatically and stream as one download.
+  Choosing their folder does the same.
 
 ## Security
 
